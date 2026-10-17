@@ -7,10 +7,12 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/restatedev/sdk-go/internal/errors"
@@ -28,7 +30,49 @@ var sharedCore []byte
 
 var _sharedCoreMod wazero.CompiledModule
 var _wazeroRuntime wazero.Runtime
+
+// Idle cores wait in two tiers. idleCores survives GC, so a service whose invocations are minutes
+// apart does not instantiate a fresh module for each one; modPool takes the overflow of a burst,
+// and GC drops what it holds.
+var idleCores = make([]idleSlot, runtime.GOMAXPROCS(0))
 var modPool sync.Pool
+
+// idleSlot is padded to a cache line so that invocations ending on different CPUs do not contend.
+type idleSlot struct {
+	core atomic.Pointer[Core]
+	_    [56]byte
+}
+
+func takeIdleCore() *Core {
+	n := len(idleCores)
+	start := int(rand.Uint32N(uint32(n)))
+	for i := range n {
+		slot := &idleCores[(start+i)%n]
+		if core := slot.core.Load(); core != nil && slot.core.CompareAndSwap(core, nil) {
+			return core
+		}
+	}
+	if core, ok := modPool.Get().(*Core); ok {
+		return core
+	}
+	return nil
+}
+
+func putIdleCore(core *Core) {
+	n := len(idleCores)
+	start := int(rand.Uint32N(uint32(n)))
+	for i := range n {
+		slot := &idleCores[(start+i)%n]
+		if slot.core.Load() == nil && slot.core.CompareAndSwap(nil, core) {
+			return
+		}
+	}
+	modPool.Put(core)
+}
+
+// maxPooledCoreMemory bounds the linear memory a core may have grown to and still be kept idle.
+// Wasm memory never shrinks, so a core that served a large payload is closed instead.
+const maxPooledCoreMemory = 4 << 20
 
 var coreTraceLogging = strings.ToLower(os.Getenv("CORE_TRACE_LOGGING_ENABLED"))
 
@@ -120,6 +164,14 @@ type Core struct {
 	// This is used to make sure the core is not concurrently accessed
 	coreMutex sync.Mutex
 
+	// inUse is true from NewCore until Close.
+	inUse atomic.Bool
+	// owner is the state machine whose VM lives in this core, nil once it is freed.
+	owner atomic.Pointer[StateMachine]
+	// poisoned is set when a call into the module trapped or panicked: its memory may be
+	// inconsistent, so the core is closed instead of reused.
+	poisoned *atomic.Bool
+
 	// Used to avoid allocating on each Call
 	callStack []uint64
 
@@ -161,10 +213,9 @@ type Core struct {
 }
 
 func NewCore(ctx context.Context) (*Core, error) {
-	// Try to get pooled instance
-	pooledInstance := modPool.Get()
-	if pooledInstance != nil {
-		return pooledInstance.(*Core), nil
+	if core := takeIdleCore(); core != nil {
+		core.inUse.Store(true)
+		return core, nil
 	}
 
 	if err := compileSharedCore(); err != nil {
@@ -188,50 +239,57 @@ func NewCore(ctx context.Context) (*Core, error) {
 	}
 	_, err = instance.ExportedFunction("init").Call(ctx, uint64(logPreFiltering))
 	if err != nil {
+		instance.Close(ctx)
 		return nil, fmt.Errorf("cannot instantiate new core: %e", err)
 	}
 
+	poisoned := new(atomic.Bool)
+	export := func(name string) api.Function {
+		return guardedFunction{Function: instance.ExportedFunction(name), poisoned: poisoned}
+	}
 	core := &Core{
 		mod:                    instance,
+		poisoned:               poisoned,
 		callStack:              make([]uint64, 4),
-		allocate:               instance.ExportedFunction("allocate"),
-		deallocate:             instance.ExportedFunction("deallocate"),
-		vmNew:                  instance.ExportedFunction("vm_new"),
-		vmGetResponseHead:      instance.ExportedFunction("vm_get_response_head"),
-		vmNotifyInput:          instance.ExportedFunction("vm_notify_input"),
-		vmNotifyInputClosed:    instance.ExportedFunction("vm_notify_input_closed"),
-		vmNotifyError:          instance.ExportedFunction("vm_notify_error"),
-		vmIsReadyToExecute:     instance.ExportedFunction("vm_is_ready_to_execute"),
-		vmIsCompleted:          instance.ExportedFunction("vm_is_completed"),
-		vmIsProcessing:         instance.ExportedFunction("vm_is_processing"),
-		vmDoProgress:           instance.ExportedFunction("vm_do_progress"),
-		vmTakeNotification:     instance.ExportedFunction("vm_take_notification"),
-		vmTakeOutput:           instance.ExportedFunction("vm_take_output"),
-		vmSysInput:             instance.ExportedFunction("vm_sys_input"),
-		vmSysStateGet:          instance.ExportedFunction("vm_sys_state_get"),
-		vmSysStateGetKeys:      instance.ExportedFunction("vm_sys_state_get_keys"),
-		vmSysStateSet:          instance.ExportedFunction("vm_sys_state_set"),
-		vmSysStateClear:        instance.ExportedFunction("vm_sys_state_clear"),
-		vmSysStateClearAll:     instance.ExportedFunction("vm_sys_state_clear_all"),
-		vmSysSleep:             instance.ExportedFunction("vm_sys_sleep"),
-		vmSysAwakeable:         instance.ExportedFunction("vm_sys_awakeable"),
-		vmSysCompleteAwakeable: instance.ExportedFunction("vm_sys_complete_awakeable"),
-		vmSysCall:              instance.ExportedFunction("vm_sys_call"),
-		vmSysSend:              instance.ExportedFunction("vm_sys_send"),
-		vmSysCancelInvocation:  instance.ExportedFunction("vm_sys_cancel_invocation"),
-		vmSysAttachInvocation:  instance.ExportedFunction("vm_sys_attach_invocation"),
-		vmSysPromiseGet:        instance.ExportedFunction("vm_sys_promise_get"),
-		vmSysPromisePeek:       instance.ExportedFunction("vm_sys_promise_peek"),
-		vmSysPromiseComplete:   instance.ExportedFunction("vm_sys_promise_complete"),
-		vmSysRun:               instance.ExportedFunction("vm_sys_run"),
-		vmProposeRunCompletion: instance.ExportedFunction("vm_propose_run_completion"),
-		vmSysWriteOutput:       instance.ExportedFunction("vm_sys_write_output"),
-		vmSysEnd:               instance.ExportedFunction("vm_sys_end"),
-		vmFree:                 instance.ExportedFunction("vm_free"),
+		allocate:               export("allocate"),
+		deallocate:             export("deallocate"),
+		vmNew:                  export("vm_new"),
+		vmGetResponseHead:      export("vm_get_response_head"),
+		vmNotifyInput:          export("vm_notify_input"),
+		vmNotifyInputClosed:    export("vm_notify_input_closed"),
+		vmNotifyError:          export("vm_notify_error"),
+		vmIsReadyToExecute:     export("vm_is_ready_to_execute"),
+		vmIsCompleted:          export("vm_is_completed"),
+		vmIsProcessing:         export("vm_is_processing"),
+		vmDoProgress:           export("vm_do_progress"),
+		vmTakeNotification:     export("vm_take_notification"),
+		vmTakeOutput:           export("vm_take_output"),
+		vmSysInput:             export("vm_sys_input"),
+		vmSysStateGet:          export("vm_sys_state_get"),
+		vmSysStateGetKeys:      export("vm_sys_state_get_keys"),
+		vmSysStateSet:          export("vm_sys_state_set"),
+		vmSysStateClear:        export("vm_sys_state_clear"),
+		vmSysStateClearAll:     export("vm_sys_state_clear_all"),
+		vmSysSleep:             export("vm_sys_sleep"),
+		vmSysAwakeable:         export("vm_sys_awakeable"),
+		vmSysCompleteAwakeable: export("vm_sys_complete_awakeable"),
+		vmSysCall:              export("vm_sys_call"),
+		vmSysSend:              export("vm_sys_send"),
+		vmSysCancelInvocation:  export("vm_sys_cancel_invocation"),
+		vmSysAttachInvocation:  export("vm_sys_attach_invocation"),
+		vmSysPromiseGet:        export("vm_sys_promise_get"),
+		vmSysPromisePeek:       export("vm_sys_promise_peek"),
+		vmSysPromiseComplete:   export("vm_sys_promise_complete"),
+		vmSysRun:               export("vm_sys_run"),
+		vmProposeRunCompletion: export("vm_propose_run_completion"),
+		vmSysWriteOutput:       export("vm_sys_write_output"),
+		vmSysEnd:               export("vm_sys_end"),
+		vmFree:                 export("vm_free"),
 	}
 
-	// Adds a finalizer to `core` to correctly close the WASM module, deallocating its memory.
-	// This gets invoked when the Pool decides to deallocate some of its entries.
+	core.inUse.Store(true)
+
+	// Closes the WASM module of a core dropped by GC: from modPool, or never closed.
 	runtime.AddCleanup(core, func(instance api.Module) {
 		instance.Close(context.Background())
 	}, instance)
@@ -239,9 +297,45 @@ func NewCore(ctx context.Context) (*Core, error) {
 	return core, nil
 }
 
+// Close ends the core's use by an invocation. The core is kept for the next invocation only if its
+// state machine was freed and no call into the module failed: the shared core then holds no
+// per-invocation state, as its VM, the only such state, was dropped by vm_free. Otherwise, or for
+// a core that grew past maxPooledCoreMemory, the module is closed.
 func (core *Core) Close(ctx context.Context) error {
-	modPool.Put(core)
+	if !core.inUse.CompareAndSwap(true, false) {
+		return nil
+	}
+	reusable := core.owner.Load() == nil &&
+		!core.poisoned.Load() &&
+		core.mod.Memory().Size() <= maxPooledCoreMemory
+	if !reusable {
+		return core.mod.Close(ctx)
+	}
+	putIdleCore(core)
 	return nil
+}
+
+// guardedFunction poisons its core when a call into the module fails, which for the shared core
+// means it trapped.
+type guardedFunction struct {
+	api.Function
+	poisoned *atomic.Bool
+}
+
+func (f guardedFunction) Call(ctx context.Context, params ...uint64) ([]uint64, error) {
+	res, err := f.Function.Call(ctx, params...)
+	if err != nil {
+		f.poisoned.Store(true)
+	}
+	return res, err
+}
+
+func (f guardedFunction) CallWithStack(ctx context.Context, stack []uint64) error {
+	err := f.Function.CallWithStack(ctx, stack)
+	if err != nil {
+		f.poisoned.Store(true)
+	}
+	return err
 }
 
 type concurrentContextUseError struct{}
@@ -250,11 +344,48 @@ func (c concurrentContextUseError) Error() string {
 	return "Concurrent context use detected; either a Context method was used while a Run() is in progress, or Context methods are being called from multiple goroutines. Failing invocation."
 }
 
-func (core *Core) NewStateMachine(ctx context.Context, headers []*pbinternal.Header) (*StateMachine, error) {
+type stateMachineFreedError struct{}
+
+func (stateMachineFreedError) Error() string {
+	return "Context used after its invocation ended; the state machine was already freed."
+}
+
+func (core *Core) lock() {
 	if !core.coreMutex.TryLock() {
 		panic(concurrentContextUseError{})
 	}
-	defer core.coreMutex.Unlock()
+}
+
+// unlock must be deferred directly, so that recover sees a panic raised while the core was held.
+// Such a panic may leave the module's memory half-written, so it poisons the core.
+func (core *Core) unlock() {
+	if r := recover(); r != nil {
+		core.poisoned.Store(true)
+		core.coreMutex.Unlock()
+		panic(r)
+	}
+	core.coreMutex.Unlock()
+}
+
+// enter takes the core for one call, refusing a state machine that was freed: its core may already
+// serve another invocation.
+func (sm *StateMachine) enter() {
+	if sm.core.owner.Load() != sm {
+		panic(stateMachineFreedError{})
+	}
+	sm.core.lock()
+	if sm.core.owner.Load() != sm {
+		sm.core.coreMutex.Unlock()
+		panic(stateMachineFreedError{})
+	}
+}
+
+func (core *Core) NewStateMachine(ctx context.Context, headers []*pbinternal.Header) (*StateMachine, error) {
+	core.lock()
+	defer core.unlock()
+	if core.owner.Load() != nil {
+		return nil, fmt.Errorf("the core already holds a state machine")
+	}
 
 	params := pbinternal.VmNewParameters{}
 	params.SetHeaders(headers)
@@ -274,9 +405,11 @@ func (core *Core) NewStateMachine(ctx context.Context, headers []*pbinternal.Hea
 	if output.HasFailure() {
 		return nil, wasmFailureToGoError(output.GetFailure())
 	}
-	return &StateMachine{
+	sm := &StateMachine{
 		core:      core,
-		vmPointer: uint64(output.GetPointer())}, nil
+		vmPointer: uint64(output.GetPointer())}
+	core.owner.Store(sm)
+	return sm, nil
 }
 
 type StateMachine struct {
@@ -285,10 +418,8 @@ type StateMachine struct {
 }
 
 func (sm *StateMachine) GetResponseHead(ctx context.Context) (*pbinternal.VmGetResponseHeadReturn, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmGetResponseHead.CallWithStack(ctx, sm.core.callStack)
@@ -304,10 +435,8 @@ func (sm *StateMachine) GetResponseHead(ctx context.Context) (*pbinternal.VmGetR
 }
 
 func (sm *StateMachine) NotifyInputClosed(ctx context.Context) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmNotifyInputClosed.CallWithStack(ctx, sm.core.callStack)
@@ -318,10 +447,8 @@ func (sm *StateMachine) NotifyInputClosed(ctx context.Context) error {
 }
 
 func (sm *StateMachine) NotifyInput(ctx context.Context, bytes []byte) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	inputPtr, inputLen := sm.core.transferBytesToWasmMemory(ctx, bytes)
 
@@ -337,10 +464,8 @@ func (sm *StateMachine) NotifyInput(ctx context.Context, bytes []byte) error {
 }
 
 func (sm *StateMachine) NotifyError(ctx context.Context, message string, stacktrace string) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	params := pbinternal.VmNotifyError{}
 	params.SetMessage(message)
@@ -359,10 +484,8 @@ func (sm *StateMachine) NotifyError(ctx context.Context, message string, stacktr
 }
 
 func (sm *StateMachine) IsReadyToExecute(ctx context.Context) (bool, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmIsReadyToExecute.CallWithStack(ctx, sm.core.callStack)
@@ -382,10 +505,8 @@ func (sm *StateMachine) IsReadyToExecute(ctx context.Context) (bool, error) {
 }
 
 func (sm *StateMachine) IsCompleted(ctx context.Context, handle uint32) (bool, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	sm.core.callStack[1] = uint64(handle)
@@ -401,10 +522,8 @@ func (sm *StateMachine) IsCompleted(ctx context.Context, handle uint32) (bool, e
 }
 
 func (sm *StateMachine) IsProcessing(ctx context.Context) (bool, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmIsProcessing.CallWithStack(ctx, sm.core.callStack)
@@ -451,10 +570,8 @@ type DoProgressExecuteRun struct {
 func (DoProgressExecuteRun) isDoProgressResult() {}
 
 func (sm *StateMachine) DoProgress(ctx context.Context, handles []uint32) (DoProgressResult, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	params := pbinternal.VmDoProgressParameters{}
 	params.SetHandles(handles)
@@ -537,10 +654,8 @@ type ValueExecuteRun struct {
 func (ValueExecuteRun) isValue() {}
 
 func (sm *StateMachine) TakeNotification(ctx context.Context, handle uint32) (Value, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	sm.core.callStack[1] = uint64(handle)
@@ -589,10 +704,8 @@ func (sm *StateMachine) TakeNotification(ctx context.Context, handle uint32) (Va
 }
 
 func (sm *StateMachine) TakeOutput(ctx context.Context) ([]byte, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmTakeOutput.CallWithStack(ctx, sm.core.callStack)
@@ -612,10 +725,8 @@ func (sm *StateMachine) TakeOutput(ctx context.Context) ([]byte, error) {
 }
 
 func (sm *StateMachine) SysInput(ctx context.Context) (*pbinternal.VmSysInputReturn_Input, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmSysInput.CallWithStack(ctx, sm.core.callStack)
@@ -635,10 +746,8 @@ func (sm *StateMachine) SysInput(ctx context.Context) (*pbinternal.VmSysInputRet
 }
 
 func (sm *StateMachine) SysStateGet(ctx context.Context, input *pbinternal.VmSysStateGetParameters) (uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	inputPtr, inputLen := sm.core.transferInputStructToWasmMemory(ctx, input)
 
@@ -661,10 +770,8 @@ func (sm *StateMachine) SysStateGet(ctx context.Context, input *pbinternal.VmSys
 }
 
 func (sm *StateMachine) SysStateGetKeys(ctx context.Context) (uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmSysStateGetKeys.CallWithStack(ctx, sm.core.callStack)
@@ -683,10 +790,8 @@ func (sm *StateMachine) SysStateGetKeys(ctx context.Context) (uint32, error) {
 }
 
 func (sm *StateMachine) SysStateSet(ctx context.Context, input *pbinternal.VmSysStateSetParameters) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	inputPtr, inputLen := sm.core.transferInputStructToWasmMemory(ctx, input)
 
@@ -709,10 +814,8 @@ func (sm *StateMachine) SysStateSet(ctx context.Context, input *pbinternal.VmSys
 }
 
 func (sm *StateMachine) SysStateClear(ctx context.Context, key string) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	params := pbinternal.VmSysStateClearParameters{}
 	params.SetKey(key)
@@ -737,10 +840,8 @@ func (sm *StateMachine) SysStateClear(ctx context.Context, key string) error {
 }
 
 func (sm *StateMachine) SysStateClearAll(ctx context.Context) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmSysStateClearAll.CallWithStack(ctx, sm.core.callStack)
@@ -760,10 +861,8 @@ func (sm *StateMachine) SysStateClearAll(ctx context.Context) error {
 }
 
 func (sm *StateMachine) SysSleep(ctx context.Context, name string, duration time.Duration) (uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	now := time.Now()
 	params := pbinternal.VmSysSleepParameters{}
@@ -791,10 +890,8 @@ func (sm *StateMachine) SysSleep(ctx context.Context, name string, duration time
 }
 
 func (sm *StateMachine) SysAwakeable(ctx context.Context) (string, uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmSysAwakeable.CallWithStack(ctx, sm.core.callStack)
@@ -813,10 +910,8 @@ func (sm *StateMachine) SysAwakeable(ctx context.Context) (string, uint32, error
 }
 
 func (sm *StateMachine) SysCall(ctx context.Context, input *pbinternal.VmSysCallParameters) (uint32, uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	inputPtr, inputLen := sm.core.transferInputStructToWasmMemory(ctx, input)
 
@@ -839,10 +934,8 @@ func (sm *StateMachine) SysCall(ctx context.Context, input *pbinternal.VmSysCall
 }
 
 func (sm *StateMachine) SysSend(ctx context.Context, input *pbinternal.VmSysSendParameters) (uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	inputPtr, inputLen := sm.core.transferInputStructToWasmMemory(ctx, input)
 
@@ -865,10 +958,8 @@ func (sm *StateMachine) SysSend(ctx context.Context, input *pbinternal.VmSysSend
 }
 
 func (sm *StateMachine) SysCancelInvocation(ctx context.Context, invocationId string) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	params := pbinternal.VmSysCancelInvocation{}
 	params.SetInvocationId(invocationId)
@@ -893,10 +984,8 @@ func (sm *StateMachine) SysCancelInvocation(ctx context.Context, invocationId st
 }
 
 func (sm *StateMachine) SysAttachInvocation(ctx context.Context, invocationId string) (uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	params := pbinternal.VmSysAttachInvocation{}
 	params.SetInvocationId(invocationId)
@@ -921,10 +1010,8 @@ func (sm *StateMachine) SysAttachInvocation(ctx context.Context, invocationId st
 }
 
 func (sm *StateMachine) SysCompleteAwakeable(ctx context.Context, input *pbinternal.VmSysCompleteAwakeableParameters) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	inputPtr, inputLen := sm.core.transferInputStructToWasmMemory(ctx, input)
 
@@ -947,10 +1034,8 @@ func (sm *StateMachine) SysCompleteAwakeable(ctx context.Context, input *pbinter
 }
 
 func (sm *StateMachine) SysPromiseGet(ctx context.Context, key string) (uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	params := pbinternal.VmSysPromiseGetParameters{}
 	params.SetKey(key)
@@ -975,10 +1060,8 @@ func (sm *StateMachine) SysPromiseGet(ctx context.Context, key string) (uint32, 
 }
 
 func (sm *StateMachine) SysPromisePeek(ctx context.Context, key string) (uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	params := pbinternal.VmSysPromisePeekParameters{}
 	params.SetKey(key)
@@ -1003,10 +1086,8 @@ func (sm *StateMachine) SysPromisePeek(ctx context.Context, key string) (uint32,
 }
 
 func (sm *StateMachine) SysPromiseComplete(ctx context.Context, input *pbinternal.VmSysPromiseCompleteParameters) (uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	inputPtr, inputLen := sm.core.transferInputStructToWasmMemory(ctx, input)
 
@@ -1029,10 +1110,8 @@ func (sm *StateMachine) SysPromiseComplete(ctx context.Context, input *pbinterna
 }
 
 func (sm *StateMachine) SysRun(ctx context.Context, name string) (uint32, error) {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	params := pbinternal.VmSysRunParameters{}
 	params.SetName(name)
@@ -1057,10 +1136,8 @@ func (sm *StateMachine) SysRun(ctx context.Context, name string) (uint32, error)
 }
 
 func (sm *StateMachine) ProposeRunCompletion(ctx context.Context, input *pbinternal.VmProposeRunCompletionParameters) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	inputPtr, inputLen := sm.core.transferInputStructToWasmMemory(ctx, input)
 
@@ -1083,10 +1160,8 @@ func (sm *StateMachine) ProposeRunCompletion(ctx context.Context, input *pbinter
 }
 
 func (sm *StateMachine) SysWriteOutput(ctx context.Context, input *pbinternal.VmSysWriteOutputParameters) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	inputPtr, inputLen := sm.core.transferInputStructToWasmMemory(ctx, input)
 
@@ -1109,10 +1184,8 @@ func (sm *StateMachine) SysWriteOutput(ctx context.Context, input *pbinternal.Vm
 }
 
 func (sm *StateMachine) SysEnd(ctx context.Context) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmSysEnd.CallWithStack(ctx, sm.core.callStack)
@@ -1131,10 +1204,9 @@ func (sm *StateMachine) SysEnd(ctx context.Context) error {
 }
 
 func (sm *StateMachine) Free(ctx context.Context) error {
-	if !sm.core.coreMutex.TryLock() {
-		panic(concurrentContextUseError{})
-	}
-	defer sm.core.coreMutex.Unlock()
+	sm.enter()
+	defer sm.core.unlock()
+	defer sm.core.owner.Store(nil)
 
 	sm.core.callStack[0] = sm.vmPointer
 	err := sm.core.vmFree.CallWithStack(ctx, sm.core.callStack)
