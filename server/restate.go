@@ -494,6 +494,11 @@ func (r *Restate) handleInvokeRequest(service, method string, writer http.Respon
 	if err != nil {
 		return
 	}
+	defer func() {
+		if err := core.Close(ctx); err != nil {
+			logger.WarnContext(ctx, "Error when closing the core", slog.Any("err", err))
+		}
+	}()
 	var headers []*pbinternal.Header
 	for k, v := range request.Header {
 		header := pbinternal.Header{}
@@ -512,9 +517,6 @@ func (r *Restate) handleInvokeRequest(service, method string, writer http.Respon
 	defer func() {
 		if err = stateMachine.Free(ctx); err != nil {
 			logger.WarnContext(ctx, "Error when freeing the state machine", slog.Any("err", err))
-		}
-		if err = core.Close(ctx); err != nil {
-			logger.WarnContext(ctx, "Error when closing the core", slog.Any("err", err))
 		}
 	}()
 
